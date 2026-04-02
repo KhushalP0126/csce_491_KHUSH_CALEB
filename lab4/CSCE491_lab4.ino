@@ -63,6 +63,9 @@
 
 #define LAB_FALLBACK_SAMPLE_RATE 8000U
 #define LAB_SERIAL_BAUD 115200
+#define LAB_AUDIO_START_DELAY_MS 10000UL
+#define LAB_LED_REFRESH_INTERVAL_US 33333UL
+#define LAB_POST_WIPE_DELAY_MS 12U
 
 typedef union {
   struct {
@@ -80,11 +83,15 @@ static uint32_t gLedColors[LAB_LED_COUNT];
 static uint32_t gCurrentSampleRate = LAB_FALLBACK_SAMPLE_RATE;
 static float gFallbackPhase = 0.0f;
 static uint32_t gPlaybackIndex = 0;
+static uint32_t gBootMillis = 0;
+static uint32_t gLastLedRefreshUs = 0;
 
 void setup_RMT();
 void setup_LEDC();
 void update_PWM(uint32_t initial, uint32_t sample);
 void transmit_led_signal(uint32_t *colors);
+void fillAllLeds(uint32_t color);
+void runPowerOnSelfTest();
 
 static uint32_t makeColor(uint8_t red, uint8_t green, uint8_t blue) {
   return ((uint32_t)green << 16) | ((uint32_t)red << 8) | blue;
@@ -149,6 +156,26 @@ static void updateVisualization(uint32_t sample) {
   transmit_led_signal(gLedColors);
 }
 
+static uint32_t nextToneSample(float frequencyHz) {
+  const float step = 2.0f * PI * 440.0f / (float)gCurrentSampleRate;
+  gFallbackPhase += step * (frequencyHz / 440.0f);
+  if (gFallbackPhase > 2.0f * PI) gFallbackPhase -= 2.0f * PI;
+
+  float s = sinf(gFallbackPhase);
+  return (uint32_t)lroundf((s * 0.5f + 0.5f) * (float)LAB_AUDIO_MAX_SAMPLE);
+}
+
+static uint32_t nextStartupSample() {
+  uint32_t elapsedMs = millis() - gBootMillis;
+  uint32_t patternMs = elapsedMs % 1000UL;
+
+  if ((patternMs < 180UL) || (patternMs >= 300UL && patternMs < 480UL)) {
+    return nextToneSample(880.0f);
+  }
+
+  return LAB_AUDIO_MAX_SAMPLE / 2U;
+}
+
 static uint32_t nextAudioSample() {
 #if LAB_HAS_AUDIO_ARRAY
   uint32_t sample = sampleArray[gPlaybackIndex++];
@@ -164,6 +191,17 @@ static uint32_t nextAudioSample() {
   float s = sinf(gFallbackPhase);
   return (uint32_t)lroundf((s * 0.5f + 0.5f) * (float)LAB_AUDIO_MAX_SAMPLE);
 #endif
+}
+
+static bool audioPlaybackEnabled() {
+  return (millis() - gBootMillis) >= LAB_AUDIO_START_DELAY_MS;
+}
+
+static void maybeUpdateVisualization(uint32_t sample) {
+  uint32_t nowUs = micros();
+  if ((uint32_t)(nowUs - gLastLedRefreshUs) < LAB_LED_REFRESH_INTERVAL_US) return;
+  gLastLedRefreshUs = nowUs;
+  updateVisualization(sample);
 }
 
 void setup_RMT() {
@@ -279,35 +317,58 @@ void transmit_led_signal(uint32_t *colors) {
   delayMicroseconds(LAB_RMT_RESET_US);
 }
 
+void fillAllLeds(uint32_t color) {
+  for (uint32_t i = 0; i < LAB_LED_COUNT; ++i) {
+    gLedColors[i] = color;
+  }
+  transmit_led_signal(gLedColors);
+}
+
+void runPowerOnSelfTest() {
+  const uint32_t postColor = scaleColor(makeColor(255, 255, 255), LAB_LED_BRIGHTNESS);
+
+  Serial.println("POST: initializing RMT and LEDC peripherals");
+  fillAllLeds(0U);
+
+  Serial.println("POST: wiping all 100 LEDs with dim white");
+  for (uint32_t i = 0; i < LAB_LED_COUNT; ++i) {
+    gLedColors[i] = postColor;
+    transmit_led_signal(gLedColors);
+    delay(LAB_POST_WIPE_DELAY_MS);
+  }
+
+  Serial.println("POST: hardware ready");
+}
+
 void setup() {
   Serial.begin(LAB_SERIAL_BAUD);
   delay(200);
-
-#if LAB_HAS_AUDIO_ARRAY
-  gCurrentSampleRate = sampleRate;
-  Serial.printf("Using array.h audio at %lu Hz\n", (unsigned long)gCurrentSampleRate);
-#else
-  Serial.printf("array.h not found, using synthesized 440 Hz tone at %lu Hz\n",
-                (unsigned long)gCurrentSampleRate);
-#endif
+  gBootMillis = millis();
+  gLastLedRefreshUs = micros();
 
   setup_RMT();
   setup_LEDC();
+  runPowerOnSelfTest();
 
-  for (uint32_t i = 0; i < LAB_LED_COUNT; ++i) {
-    gLedColors[i] = 0U;
-  }
-  transmit_led_signal(gLedColors);
+#if LAB_HAS_AUDIO_ARRAY
+  gCurrentSampleRate = sampleRate;
+  Serial.printf("array.h detected, sampleRate = %lu Hz\n", (unsigned long)gCurrentSampleRate);
+#else
+  Serial.printf("array.h not found, fallback synth sampleRate = %lu Hz\n",
+                (unsigned long)gCurrentSampleRate);
+#endif
+  Serial.printf("Startup beep pattern active for %lu ms before audio playback\n",
+                (unsigned long)LAB_AUDIO_START_DELAY_MS);
 
-  uint32_t firstSample = nextAudioSample();
+  uint32_t firstSample = nextStartupSample();
   update_PWM(1, firstSample);
-  updateVisualization(firstSample);
+  maybeUpdateVisualization(firstSample);
 }
 
 void loop() {
   if (!(REG_READ(LAB_LEDC_INT_RAW_REG) & LEDC_LSTIMER0_OVF_INT_RAW)) return;
 
-  uint32_t sample = nextAudioSample();
+  uint32_t sample = audioPlaybackEnabled() ? nextAudioSample() : nextStartupSample();
   update_PWM(0, sample);
-  updateVisualization(sample);
+  maybeUpdateVisualization(sample);
 }
