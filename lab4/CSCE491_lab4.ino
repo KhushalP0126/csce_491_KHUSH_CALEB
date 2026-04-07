@@ -22,6 +22,8 @@
 #define LAB_LED_BRIGHTNESS 32
 #define LAB_AUDIO_RESOLUTION_BITS 8
 #define LAB_AUDIO_MAX_SAMPLE ((1U << LAB_AUDIO_RESOLUTION_BITS) - 1U)
+#define LAB_AUDIO_MIDPOINT_SAMPLE ((LAB_AUDIO_MAX_SAMPLE + 1U) / 2U)
+#define LAB_AUDIO_PWM_BASE_CLK_HZ 80000000UL
 
 #define LAB_RMT_RAM_REG RMT_CH0DATA_REG
 #define LAB_RMT_CH0_CONF0_REG RMT_CH0CONF0_REG
@@ -66,6 +68,9 @@
 #define LAB_AUDIO_START_DELAY_MS 10000UL
 #define LAB_LED_REFRESH_INTERVAL_US 33333UL
 #define LAB_POST_WIPE_DELAY_MS 12U
+#define LAB_VIS_LOG_MIN -5.5f
+#define LAB_VIS_ATTACK_ALPHA 0.35f
+#define LAB_VIS_RELEASE_ALPHA 0.12f
 
 typedef union {
   struct {
@@ -82,6 +87,7 @@ static volatile RmtItem32 *const gRmtRam = reinterpret_cast<volatile RmtItem32 *
 static uint32_t gLedColors[LAB_LED_COUNT];
 static uint32_t gCurrentSampleRate = LAB_FALLBACK_SAMPLE_RATE;
 static float gFallbackPhase = 0.0f;
+static float gVisualizationEnvelope = 0.0f;
 static uint32_t gPlaybackIndex = 0;
 static uint32_t gBootMillis = 0;
 static uint32_t gLastLedRefreshUs = 0;
@@ -95,6 +101,22 @@ void runPowerOnSelfTest();
 
 static uint32_t makeColor(uint8_t red, uint8_t green, uint8_t blue) {
   return ((uint32_t)green << 16) | ((uint32_t)red << 8) | blue;
+}
+
+static float clampUnit(float value) {
+  if (value < 0.0f) return 0.0f;
+  if (value > 1.0f) return 1.0f;
+  return value;
+}
+
+static uint32_t computeLedcClockDivider(uint32_t sampleRate) {
+  if (!sampleRate) sampleRate = LAB_FALLBACK_SAMPLE_RATE;
+
+  uint32_t dividerFixed =
+      (uint32_t)lroundf((float)LAB_AUDIO_PWM_BASE_CLK_HZ / (float)sampleRate);
+  if (dividerFixed < 256U) dividerFixed = 256U;
+  if (dividerFixed > LEDC_CLK_DIV_LSTIMER0_V) dividerFixed = LEDC_CLK_DIV_LSTIMER0_V;
+  return dividerFixed;
 }
 
 static uint32_t scaleColor(uint32_t color, uint8_t scale) {
@@ -135,19 +157,32 @@ static uint32_t colorForLevel(float normalized) {
   return makeColor(red, green, blue);
 }
 
-static uint32_t computeLedCountFromSample(uint32_t sample) {
-  float ratio = ((float)sample + 1.0f) / 256.0f;
-  float logValue = log10f(ratio);
-  float normalized = (logValue + 2.4f) / 2.4f;
-  if (normalized < 0.0f) normalized = 0.0f;
-  if (normalized > 1.0f) normalized = 1.0f;
+static uint32_t computeSampleMagnitude(uint32_t sample) {
+  int32_t centered = (int32_t)sample - (int32_t)LAB_AUDIO_MIDPOINT_SAMPLE;
+  uint32_t magnitude = (uint32_t)(centered < 0 ? -centered : centered) * 2U;
+  if (magnitude > LAB_AUDIO_MAX_SAMPLE) magnitude = LAB_AUDIO_MAX_SAMPLE;
+  return magnitude;
+}
+
+static uint32_t computeLedCountFromLevel(float level) {
+  float magnitude = clampUnit(level) * (float)LAB_AUDIO_MAX_SAMPLE;
+  if (magnitude < 1.0f) magnitude = 1.0f;
+
+  float logValue = logf(magnitude / 256.0f);
+  if (logValue < LAB_VIS_LOG_MIN) logValue = LAB_VIS_LOG_MIN;
+
+  float normalized = clampUnit((logValue - LAB_VIS_LOG_MIN) / -LAB_VIS_LOG_MIN);
   return (uint32_t)lroundf(normalized * (float)LAB_LED_COUNT);
 }
 
 static void updateVisualization(uint32_t sample) {
-  uint32_t ledsOn = computeLedCountFromSample(sample);
-  float normalized = (float)sample / (float)LAB_AUDIO_MAX_SAMPLE;
-  uint32_t activeColor = scaleColor(colorForLevel(normalized), LAB_LED_BRIGHTNESS);
+  float targetLevel = (float)computeSampleMagnitude(sample) / (float)LAB_AUDIO_MAX_SAMPLE;
+  float alpha = (targetLevel > gVisualizationEnvelope) ? LAB_VIS_ATTACK_ALPHA : LAB_VIS_RELEASE_ALPHA;
+  gVisualizationEnvelope += alpha * (targetLevel - gVisualizationEnvelope);
+  gVisualizationEnvelope = clampUnit(gVisualizationEnvelope);
+
+  uint32_t ledsOn = computeLedCountFromLevel(gVisualizationEnvelope);
+  uint32_t activeColor = scaleColor(colorForLevel(gVisualizationEnvelope), LAB_LED_BRIGHTNESS);
 
   for (uint32_t i = 0; i < LAB_LED_COUNT; ++i) {
     gLedColors[i] = (i < ledsOn) ? activeColor : 0U;
@@ -173,7 +208,7 @@ static uint32_t nextStartupSample() {
     return nextToneSample(880.0f);
   }
 
-  return LAB_AUDIO_MAX_SAMPLE / 2U;
+  return LAB_AUDIO_MIDPOINT_SAMPLE;
 }
 
 static uint32_t nextAudioSample() {
@@ -224,6 +259,7 @@ void setup_RMT() {
   chConf &= ~RMT_IDLE_OUT_LV_CH0;
   chConf &= ~RMT_CARRIER_EN_CH0;
   REG_WRITE(LAB_RMT_CH0_CONF0_REG, chConf);
+  REG_SET_BIT(LAB_RMT_CH0_CONF0_REG, RMT_CONF_UPDATE_CH0);
 
   REG_WRITE(LAB_RMT_INT_CLR_REG, RMT_CH0_TX_END_INT_CLR);
 
@@ -239,9 +275,7 @@ void setup_LEDC() {
 
   REG_WRITE(LAB_LEDC_CONF_REG, LEDC_CLK_EN | (1U << LEDC_APB_CLK_SEL_S));
 
-  uint32_t dividerFixed = (uint32_t)lroundf((80000000.0f / (float)gCurrentSampleRate) * 256.0f);
-  if (dividerFixed < 256U) dividerFixed = 256U;
-  if (dividerFixed > LEDC_CLK_DIV_LSTIMER0_V) dividerFixed = LEDC_CLK_DIV_LSTIMER0_V;
+  uint32_t dividerFixed = computeLedcClockDivider(gCurrentSampleRate);
 
   uint32_t timerConf = 0;
   timerConf |= ((uint32_t)LAB_AUDIO_RESOLUTION_BITS << LEDC_LSTIMER0_DUTY_RES_S);
@@ -310,6 +344,7 @@ void transmit_led_signal(uint32_t *colors) {
     REG_CLR_BIT(LAB_RMT_CH0_CONF0_REG, RMT_APB_MEM_RST_CH0);
     REG_SET_BIT(LAB_RMT_CH0_CONF0_REG, RMT_MEM_RD_RST_CH0);
     REG_CLR_BIT(LAB_RMT_CH0_CONF0_REG, RMT_MEM_RD_RST_CH0);
+    REG_SET_BIT(LAB_RMT_CH0_CONF0_REG, RMT_CONF_UPDATE_CH0);
     REG_SET_BIT(LAB_RMT_CH0_CONF0_REG, RMT_TX_START_CH0);
     waitForRmtDone();
   }
@@ -346,12 +381,15 @@ void setup() {
   gBootMillis = millis();
   gLastLedRefreshUs = micros();
 
+#if LAB_HAS_AUDIO_ARRAY
+  gCurrentSampleRate = sampleRate;
+#endif
+
   setup_RMT();
   setup_LEDC();
   runPowerOnSelfTest();
 
 #if LAB_HAS_AUDIO_ARRAY
-  gCurrentSampleRate = sampleRate;
   Serial.printf("array.h detected, sampleRate = %lu Hz\n", (unsigned long)gCurrentSampleRate);
 #else
   Serial.printf("array.h not found, fallback synth sampleRate = %lu Hz\n",
