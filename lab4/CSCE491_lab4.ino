@@ -1,374 +1,327 @@
 #include <Arduino.h>
 #include <math.h>
 
+#include "esp_cpu.h"
 #include "soc/gpio_reg.h"
 #include "soc/gpio_sig_map.h"
 #include "soc/io_mux_reg.h"
 #include "soc/ledc_reg.h"
-#include "soc/rmt_reg.h"
 #include "soc/soc.h"
 #include "soc/system_reg.h"
 
 #if __has_include("array.h")
 #include "array.h"
-#define LAB_HAS_AUDIO_ARRAY 1
+#define HAS_AUDIO_ARRAY 1
 #else
-#define LAB_HAS_AUDIO_ARRAY 0
+#define HAS_AUDIO_ARRAY 0
 #endif
 
-#define LAB_AUDIO_PIN 33
-#define LAB_LED_PIN 14
-#define LAB_LED_COUNT 100
-#define LAB_LED_BRIGHTNESS 32
-#define LAB_AUDIO_RESOLUTION_BITS 8
-#define LAB_AUDIO_MAX_SAMPLE ((1U << LAB_AUDIO_RESOLUTION_BITS) - 1U)
+// ===== Pin Configuration =====
+#define AUDIO_PIN 33
+#define LED_PIN 14
 
-#define LAB_RMT_RAM_REG RMT_CH0DATA_REG
-#define LAB_RMT_CH0_CONF0_REG RMT_CH0CONF0_REG
-#define LAB_RMT_SYS_CONF_REG RMT_SYS_CONF_REG
-#define LAB_RMT_INT_RAW_REG RMT_INT_RAW_REG
-#define LAB_RMT_INT_CLR_REG RMT_INT_CLR_REG
-#define LAB_RMT_CLOCK_EN_REG SYSTEM_PERIP_CLK_EN0_REG
-#define LAB_RMT_RESET_REG SYSTEM_PERIP_RST_EN0_REG
+// ===== Audio Configuration =====
+#define AUDIO_RES_BITS 8U
+#define AUDIO_PWM_RATE 62500UL
+#define AUDIO_MAX_SAMPLE ((1U << AUDIO_RES_BITS) - 1U)
+#define LEDC_BASE_CLK_HZ 80000000UL
 
-#define LAB_LEDC_CONF_REG LEDC_CONF_REG
-#define LAB_LEDC_TIMER0_CONF_REG LEDC_LSTIMER0_CONF_REG
-#define LAB_LEDC_CH0_CONF0_REG LEDC_LSCH0_CONF0_REG
-#define LAB_LEDC_CH0_CONF1_REG LEDC_LSCH0_CONF1_REG
-#define LAB_LEDC_CH0_HPOINT_REG LEDC_LSCH0_HPOINT_REG
-#define LAB_LEDC_CH0_DUTY_REG LEDC_LSCH0_DUTY_REG
-#define LAB_LEDC_INT_RAW_REG LEDC_INT_RAW_REG
-#define LAB_LEDC_INT_CLR_REG LEDC_INT_CLR_REG
-#define LAB_LEDC_CLOCK_EN_REG SYSTEM_PERIP_CLK_EN0_REG
-#define LAB_LEDC_RESET_REG SYSTEM_PERIP_RST_EN0_REG
+#if HAS_AUDIO_ARRAY
+#define AUDIO_SAMPLE_RATE sampleRate
+#else
+#define AUDIO_SAMPLE_RATE 16000U
+#endif
 
-#define LAB_GPIO_AUDIO_OUT_SEL_REG GPIO_FUNC33_OUT_SEL_CFG_REG
-#define LAB_GPIO_LED_OUT_SEL_REG GPIO_FUNC14_OUT_SEL_CFG_REG
-#define LAB_IO_MUX_AUDIO_REG IO_MUX_GPIO33_REG
-#define LAB_IO_MUX_LED_REG IO_MUX_GPIO14_REG
+// ===== LED Configuration =====
+#define NUM_LEDS 100U
+#define AUDIO_LED_UPDATE_INTERVAL 256U
+#define NUM_BANDS 5U
+#define LEDS_PER_BAND (NUM_LEDS / NUM_BANDS)
 
-#define LAB_GPIO_OUT_SEL_MASK 0x1FFU
-#define LAB_GPIO_OUT_INV_SEL (1U << 9)
-#define LAB_GPIO_OEN_SEL (1U << 10)
-#define LAB_GPIO_OEN_INV_SEL (1U << 11)
+#ifndef F_CPU
+#define F_CPU 240000000UL
+#endif
 
-#define LAB_LEDC_GPIO_FUNC_SEL LEDC_LS_SIG_OUT0_IDX
-#define LAB_RMT_GPIO_FUNC_SEL RMT_SIG_OUT0_IDX
+#define WS2812_T0H_NS 350U
+#define WS2812_T1H_NS 700U
+#define WS2812_TOTAL_NS 1250U
+#define WS2812_RESET_US 80U
 
-#define LAB_RMT_T0H_TICKS 32
-#define LAB_RMT_T0L_TICKS 68
-#define LAB_RMT_T1H_TICKS 64
-#define LAB_RMT_T1L_TICKS 36
-#define LAB_RMT_RESET_US 80
+#define NS_TO_CPU_CYCLES(ns) ((uint32_t)(((uint64_t)F_CPU * (uint64_t)(ns) + 999999999ULL) / 1000000000ULL))
+#define LED_PIN_MASK (1UL << LED_PIN)
+#define AUDIO_PIN_HIGH_MASK (1UL << (AUDIO_PIN - 32U))
 
-#define LAB_FALLBACK_SAMPLE_RATE 8000U
-#define LAB_SERIAL_BAUD 115200
-#define LAB_AUDIO_START_DELAY_MS 10000UL
-#define LAB_LED_REFRESH_INTERVAL_US 33333UL
-#define LAB_POST_WIPE_DELAY_MS 12U
+// ===== Globals =====
+static uint32_t sample_period_us;
+static uint32_t sample_period_rem;
+static uint32_t g_led_colors[NUM_LEDS];
+static float g_lowpass_120 = 0.0f;
+static float g_lowpass_300 = 0.0f;
+static float g_lowpass_600 = 0.0f;
+static float g_lowpass_1200 = 0.0f;
+static float g_lowpass_2400 = 0.0f;
+static float g_band_envelopes[NUM_BANDS] = {0.0f};
 
-typedef union {
-  struct {
-    uint32_t duration0 : 15;
-    uint32_t level0 : 1;
-    uint32_t duration1 : 15;
-    uint32_t level1 : 1;
-  };
-  uint32_t val;
-} RmtItem32;
-
-static volatile RmtItem32 *const gRmtRam = reinterpret_cast<volatile RmtItem32 *>(LAB_RMT_RAM_REG);
-
-static uint32_t gLedColors[LAB_LED_COUNT];
-static uint32_t gCurrentSampleRate = LAB_FALLBACK_SAMPLE_RATE;
-static float gFallbackPhase = 0.0f;
-static uint32_t gPlaybackIndex = 0;
-static uint32_t gBootMillis = 0;
-static uint32_t gLastLedRefreshUs = 0;
-
-void setup_RMT();
+// ===== Audio Functions =====
+void setupAudio();
 void setup_LEDC();
-void update_PWM(uint32_t initial, uint32_t sample);
+void updateAudioSample(uint8_t sample);
+void play_audio_array_once();
+void stop_audio_output();
+
+// ===== LED Functions =====
+void setupLedStrip();
+void build_audio_visual_frame(uint8_t sample, uint32_t sample_index);
+void send_led_frame();
+void clear_leds();
 void transmit_led_signal(uint32_t *colors);
-void fillAllLeds(uint32_t color);
-void runPowerOnSelfTest();
+uint32_t make_color(uint8_t r, uint8_t g, uint8_t b);
+uint32_t scale_color(uint32_t color, float scale);
+static inline void wait_cycles(uint32_t cycles);
+static inline void led_pin_high();
+static inline void led_pin_low();
+static inline void send_led_byte(uint8_t value);
 
-static uint32_t makeColor(uint8_t red, uint8_t green, uint8_t blue) {
-  return ((uint32_t)green << 16) | ((uint32_t)red << 8) | blue;
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  sample_period_us = 1000000UL / AUDIO_SAMPLE_RATE;
+  sample_period_rem = 1000000UL % AUDIO_SAMPLE_RATE;
+
+  setupLedStrip();
+  setupAudio();
+
+  #if HAS_AUDIO_ARRAY
+  Serial.println("AUDIO ARRAY: playing array.h once");
+  play_audio_array_once();
+  stop_audio_output();
+  #else
+  Serial.println("AUDIO ARRAY: array.h not found, skipping playback");
+  #endif
 }
 
-static uint32_t scaleColor(uint32_t color, uint8_t scale) {
-  uint8_t green = (uint8_t)(((color >> 16) & 0xFFU) * scale / 255U);
-  uint8_t red = (uint8_t)(((color >> 8) & 0xFFU) * scale / 255U);
-  uint8_t blue = (uint8_t)((color & 0xFFU) * scale / 255U);
-  return makeColor(red, green, blue);
+void loop() {
+  delay(1000);
 }
 
-static uint32_t colorForLevel(float normalized) {
-  if (normalized < 0.0f) normalized = 0.0f;
-  if (normalized > 1.0f) normalized = 1.0f;
-
-  const uint32_t anchors[5] = {
-      makeColor(255, 0, 0),
-      makeColor(255, 255, 0),
-      makeColor(255, 255, 85),
-      makeColor(255, 255, 171),
-      makeColor(255, 255, 255),
-  };
-
-  float scaled = normalized * 4.0f;
-  int index = (int)scaled;
-  if (index >= 4) return anchors[4];
-
-  float mix = scaled - (float)index;
-  uint8_t r0 = (uint8_t)((anchors[index] >> 8) & 0xFFU);
-  uint8_t g0 = (uint8_t)((anchors[index] >> 16) & 0xFFU);
-  uint8_t b0 = (uint8_t)(anchors[index] & 0xFFU);
-
-  uint8_t r1 = (uint8_t)((anchors[index + 1] >> 8) & 0xFFU);
-  uint8_t g1 = (uint8_t)((anchors[index + 1] >> 16) & 0xFFU);
-  uint8_t b1 = (uint8_t)(anchors[index + 1] & 0xFFU);
-
-  uint8_t red = (uint8_t)(r0 + (r1 - r0) * mix);
-  uint8_t green = (uint8_t)(g0 + (g1 - g0) * mix);
-  uint8_t blue = (uint8_t)(b0 + (b1 - b0) * mix);
-  return makeColor(red, green, blue);
-}
-
-static uint32_t computeLedCountFromSample(uint32_t sample) {
-  float ratio = ((float)sample + 1.0f) / 256.0f;
-  float logValue = log10f(ratio);
-  float normalized = (logValue + 2.4f) / 2.4f;
-  if (normalized < 0.0f) normalized = 0.0f;
-  if (normalized > 1.0f) normalized = 1.0f;
-  return (uint32_t)lroundf(normalized * (float)LAB_LED_COUNT);
-}
-
-static void updateVisualization(uint32_t sample) {
-  uint32_t ledsOn = computeLedCountFromSample(sample);
-  float normalized = (float)sample / (float)LAB_AUDIO_MAX_SAMPLE;
-  uint32_t activeColor = scaleColor(colorForLevel(normalized), LAB_LED_BRIGHTNESS);
-
-  for (uint32_t i = 0; i < LAB_LED_COUNT; ++i) {
-    gLedColors[i] = (i < ledsOn) ? activeColor : 0U;
-  }
-
-  transmit_led_signal(gLedColors);
-}
-
-static uint32_t nextToneSample(float frequencyHz) {
-  const float step = 2.0f * PI * 440.0f / (float)gCurrentSampleRate;
-  gFallbackPhase += step * (frequencyHz / 440.0f);
-  if (gFallbackPhase > 2.0f * PI) gFallbackPhase -= 2.0f * PI;
-
-  float s = sinf(gFallbackPhase);
-  return (uint32_t)lroundf((s * 0.5f + 0.5f) * (float)LAB_AUDIO_MAX_SAMPLE);
-}
-
-static uint32_t nextStartupSample() {
-  uint32_t elapsedMs = millis() - gBootMillis;
-  uint32_t patternMs = elapsedMs % 1000UL;
-
-  if ((patternMs < 180UL) || (patternMs >= 300UL && patternMs < 480UL)) {
-    return nextToneSample(880.0f);
-  }
-
-  return LAB_AUDIO_MAX_SAMPLE / 2U;
-}
-
-static uint32_t nextAudioSample() {
-#if LAB_HAS_AUDIO_ARRAY
-  uint32_t sample = sampleArray[gPlaybackIndex++];
-  if (gPlaybackIndex >= sizeof(sampleArray) / sizeof(sampleArray[0])) {
-    gPlaybackIndex = 0;
-  }
-  return sample;
-#else
-  const float step = 2.0f * PI * 440.0f / (float)gCurrentSampleRate;
-  gFallbackPhase += step;
-  if (gFallbackPhase > 2.0f * PI) gFallbackPhase -= 2.0f * PI;
-
-  float s = sinf(gFallbackPhase);
-  return (uint32_t)lroundf((s * 0.5f + 0.5f) * (float)LAB_AUDIO_MAX_SAMPLE);
-#endif
-}
-
-static bool audioPlaybackEnabled() {
-  return (millis() - gBootMillis) >= LAB_AUDIO_START_DELAY_MS;
-}
-
-static void maybeUpdateVisualization(uint32_t sample) {
-  uint32_t nowUs = micros();
-  if ((uint32_t)(nowUs - gLastLedRefreshUs) < LAB_LED_REFRESH_INTERVAL_US) return;
-  gLastLedRefreshUs = nowUs;
-  updateVisualization(sample);
-}
-
-void setup_RMT() {
-  REG_SET_BIT(LAB_RMT_CLOCK_EN_REG, SYSTEM_RMT_CLK_EN);
-  REG_SET_BIT(LAB_RMT_RESET_REG, SYSTEM_RMT_RST);
-  REG_CLR_BIT(LAB_RMT_RESET_REG, SYSTEM_RMT_RST);
-
-  uint32_t sysConf = 0;
-  sysConf &= ~RMT_APB_FIFO_MASK;
-  sysConf |= RMT_MEM_CLK_FORCE_ON;
-  sysConf |= RMT_CLK_EN;
-  sysConf |= RMT_SCLK_ACTIVE;
-  sysConf |= (1U << RMT_SCLK_SEL_S);
-  REG_WRITE(LAB_RMT_SYS_CONF_REG, sysConf);
-
-  uint32_t chConf = 0;
-  chConf |= (1U << RMT_DIV_CNT_CH0_S);
-  chConf |= (1U << RMT_MEM_SIZE_CH0_S);
-  chConf |= RMT_IDLE_OUT_EN_CH0;
-  chConf &= ~RMT_IDLE_OUT_LV_CH0;
-  chConf &= ~RMT_CARRIER_EN_CH0;
-  REG_WRITE(LAB_RMT_CH0_CONF0_REG, chConf);
-
-  REG_WRITE(LAB_RMT_INT_CLR_REG, RMT_CH0_TX_END_INT_CLR);
-
-  pinMode(LAB_LED_PIN, OUTPUT);
-  PIN_FUNC_SELECT(LAB_IO_MUX_LED_REG, PIN_FUNC_GPIO);
-  REG_WRITE(LAB_GPIO_LED_OUT_SEL_REG, LAB_RMT_GPIO_FUNC_SEL);
+// ===== Audio Section =====
+void setupAudio() {
+  setup_LEDC();
 }
 
 void setup_LEDC() {
-  REG_SET_BIT(LAB_LEDC_CLOCK_EN_REG, SYSTEM_LEDC_CLK_EN);
-  REG_SET_BIT(LAB_LEDC_RESET_REG, SYSTEM_LEDC_RST);
-  REG_CLR_BIT(LAB_LEDC_RESET_REG, SYSTEM_LEDC_RST);
+  REG_SET_BIT(SYSTEM_PERIP_CLK_EN0_REG, SYSTEM_LEDC_CLK_EN);
+  REG_SET_BIT(SYSTEM_PERIP_RST_EN0_REG, SYSTEM_LEDC_RST);
+  REG_CLR_BIT(SYSTEM_PERIP_RST_EN0_REG, SYSTEM_LEDC_RST);
 
-  REG_WRITE(LAB_LEDC_CONF_REG, LEDC_CLK_EN | (1U << LEDC_APB_CLK_SEL_S));
+  PIN_FUNC_SELECT(IO_MUX_GPIO33_REG, PIN_FUNC_GPIO);
+  REG_WRITE(GPIO_FUNC33_OUT_SEL_CFG_REG, LEDC_LS_SIG_OUT0_IDX);
 
-  uint32_t dividerFixed = (uint32_t)lroundf((80000000.0f / (float)gCurrentSampleRate) * 256.0f);
-  if (dividerFixed < 256U) dividerFixed = 256U;
-  if (dividerFixed > LEDC_CLK_DIV_LSTIMER0_V) dividerFixed = LEDC_CLK_DIV_LSTIMER0_V;
+  REG_WRITE(LEDC_CONF_REG, LEDC_CLK_EN | (1U << LEDC_APB_CLK_SEL_S));
 
-  uint32_t timerConf = 0;
-  timerConf |= ((uint32_t)LAB_AUDIO_RESOLUTION_BITS << LEDC_LSTIMER0_DUTY_RES_S);
-  timerConf |= (dividerFixed << LEDC_CLK_DIV_LSTIMER0_S);
-  timerConf |= LEDC_TICK_SEL_LSTIMER0;
-  timerConf &= ~LEDC_LSTIMER0_PAUSE;
-  timerConf &= ~LEDC_LSTIMER0_RST;
-  REG_WRITE(LAB_LEDC_TIMER0_CONF_REG, timerConf);
-  REG_SET_BIT(LAB_LEDC_TIMER0_CONF_REG, LEDC_LSTIMER0_PARA_UP);
+  // LEDC divider uses an 8-bit fractional part on ESP32-S3.
+  uint32_t divider_fixed =
+      (uint32_t)lroundf(((float)LEDC_BASE_CLK_HZ * 256.0f) /
+                        ((float)AUDIO_PWM_RATE * (float)(1U << AUDIO_RES_BITS)));
+  if (divider_fixed < 256U) divider_fixed = 256U;
+  if (divider_fixed > LEDC_CLK_DIV_LSTIMER0_V) divider_fixed = LEDC_CLK_DIV_LSTIMER0_V;
 
-  REG_WRITE(LAB_LEDC_CH0_HPOINT_REG, 0);
-  REG_WRITE(LAB_LEDC_CH0_DUTY_REG, 0);
-  REG_WRITE(LAB_LEDC_CH0_CONF0_REG, LEDC_SIG_OUT_EN_LSCH0);
-  REG_WRITE(LAB_LEDC_CH0_CONF1_REG, 0);
-  REG_WRITE(LAB_LEDC_INT_CLR_REG, LEDC_LSTIMER0_OVF_INT_CLR);
+  uint32_t timer_conf = 0U;
+  timer_conf |= (divider_fixed << LEDC_CLK_DIV_LSTIMER0_S);
+  timer_conf |= ((uint32_t)AUDIO_RES_BITS << LEDC_LSTIMER0_DUTY_RES_S);
+  timer_conf &= ~LEDC_LSTIMER0_PAUSE;
+  timer_conf &= ~LEDC_LSTIMER0_RST;
+  REG_WRITE(LEDC_LSTIMER0_CONF_REG, timer_conf);
+  REG_SET_BIT(LEDC_LSTIMER0_CONF_REG, LEDC_LSTIMER0_PARA_UP);
 
-  pinMode(LAB_AUDIO_PIN, OUTPUT);
-  PIN_FUNC_SELECT(LAB_IO_MUX_AUDIO_REG, PIN_FUNC_GPIO);
-  REG_WRITE(LAB_GPIO_AUDIO_OUT_SEL_REG, LAB_LEDC_GPIO_FUNC_SEL);
+  REG_WRITE(LEDC_LSCH0_HPOINT_REG, 0U);
+  REG_WRITE(LEDC_LSCH0_DUTY_REG, 0U);
+  REG_WRITE(LEDC_LSCH0_CONF0_REG, LEDC_SIG_OUT_EN_LSCH0);
+  REG_WRITE(LEDC_LSCH0_CONF1_REG, 0U);
+  REG_WRITE(LEDC_INT_CLR_REG, LEDC_LSTIMER0_OVF_INT_CLR);
 }
 
-void update_PWM(uint32_t initial, uint32_t sample) {
-  if (!initial && !(REG_READ(LAB_LEDC_INT_RAW_REG) & LEDC_LSTIMER0_OVF_INT_RAW)) {
-    return;
+void updateAudioSample(uint8_t sample) {
+  REG_WRITE(LEDC_LSCH0_DUTY_REG, ((uint32_t)sample & AUDIO_MAX_SAMPLE) << 4);
+  REG_SET_BIT(LEDC_LSCH0_CONF0_REG, LEDC_PARA_UP_LSCH0);
+  REG_SET_BIT(LEDC_LSCH0_CONF1_REG, LEDC_DUTY_START_LSCH0);
+}
+
+void play_audio_array_once() {
+  #if HAS_AUDIO_ARRAY
+  uint32_t sample_count = sizeof(sampleArray) / sizeof(sampleArray[0]);
+  uint32_t next_sample_time = micros();
+  uint32_t rem_accumulator = 0U;
+
+  for (uint32_t i = 0; i < sample_count; ++i) {
+    uint8_t sample = sampleArray[i] & 0xFFU;
+    updateAudioSample(sample);
+
+    if ((i % AUDIO_LED_UPDATE_INTERVAL) == 0U) {
+      build_audio_visual_frame(sample, i);
+      send_led_frame();
+    }
+
+    next_sample_time += sample_period_us;
+    rem_accumulator += sample_period_rem;
+    if (rem_accumulator >= AUDIO_SAMPLE_RATE) {
+      next_sample_time += 1U;
+      rem_accumulator -= AUDIO_SAMPLE_RATE;
+    }
+
+    while ((int32_t)(micros() - next_sample_time) < 0) {}
   }
 
-  REG_WRITE(LAB_LEDC_INT_CLR_REG, LEDC_LSTIMER0_OVF_INT_CLR);
-
-  uint32_t clamped = sample & LAB_AUDIO_MAX_SAMPLE;
-  REG_WRITE(LAB_LEDC_CH0_DUTY_REG, clamped << 4);
-  REG_SET_BIT(LAB_LEDC_CH0_CONF0_REG, LEDC_PARA_UP_LSCH0);
-  REG_SET_BIT(LAB_LEDC_CH0_CONF1_REG, LEDC_DUTY_START_LSCH0);
+  clear_leds();
+  #endif
 }
 
-static void waitForRmtDone() {
-  while (!(REG_READ(LAB_RMT_INT_RAW_REG) & RMT_CH0_TX_END_INT_RAW)) {
+void stop_audio_output() {
+  updateAudioSample(0U);
+  REG_WRITE(LEDC_LSCH0_CONF0_REG, 0U);
+  REG_WRITE(GPIO_FUNC33_OUT_SEL_CFG_REG, SIG_GPIO_OUT_IDX);
+  REG_WRITE(GPIO_ENABLE1_W1TS_REG, AUDIO_PIN_HIGH_MASK);
+  REG_WRITE(GPIO_OUT1_W1TC_REG, AUDIO_PIN_HIGH_MASK);
+}
+
+// ===== LED Section =====
+void setupLedStrip() {
+  PIN_FUNC_SELECT(IO_MUX_GPIO14_REG, PIN_FUNC_GPIO);
+  REG_WRITE(GPIO_FUNC14_OUT_SEL_CFG_REG, SIG_GPIO_OUT_IDX);
+  REG_WRITE(GPIO_ENABLE_W1TS_REG, LED_PIN_MASK);
+  REG_WRITE(GPIO_OUT_W1TC_REG, LED_PIN_MASK);
+  clear_leds();
+}
+
+static inline void wait_cycles(uint32_t cycles) {
+  uint32_t start = esp_cpu_get_cycle_count();
+  while ((uint32_t)(esp_cpu_get_cycle_count() - start) < cycles) {
   }
-  REG_WRITE(LAB_RMT_INT_CLR_REG, RMT_CH0_TX_END_INT_CLR);
 }
 
-static void loadRmtWord(uint32_t index, uint8_t value) {
+static inline void led_pin_high() {
+  REG_WRITE(GPIO_OUT_W1TS_REG, LED_PIN_MASK);
+}
+
+static inline void led_pin_low() {
+  REG_WRITE(GPIO_OUT_W1TC_REG, LED_PIN_MASK);
+}
+
+static inline void send_led_byte(uint8_t value) {
+  const uint32_t t0h_cycles = NS_TO_CPU_CYCLES(WS2812_T0H_NS);
+  const uint32_t t1h_cycles = NS_TO_CPU_CYCLES(WS2812_T1H_NS);
+  const uint32_t total_cycles = NS_TO_CPU_CYCLES(WS2812_TOTAL_NS);
+
   for (int bit = 7; bit >= 0; --bit) {
-    bool one = ((value >> bit) & 0x1U) != 0;
-    uint32_t itemIndex = index++;
-    gRmtRam[itemIndex].duration0 = one ? LAB_RMT_T1H_TICKS : LAB_RMT_T0H_TICKS;
-    gRmtRam[itemIndex].level0 = 1;
-    gRmtRam[itemIndex].duration1 = one ? LAB_RMT_T1L_TICKS : LAB_RMT_T0L_TICKS;
-    gRmtRam[itemIndex].level1 = 0;
+    bool one = ((value >> bit) & 0x01U) != 0;
+    uint32_t bit_start = esp_cpu_get_cycle_count();
+
+    led_pin_high();
+    while ((uint32_t)(esp_cpu_get_cycle_count() - bit_start) < (one ? t1h_cycles : t0h_cycles)) {
+    }
+
+    led_pin_low();
+    while ((uint32_t)(esp_cpu_get_cycle_count() - bit_start) < total_cycles) {
+    }
   }
 }
 
 void transmit_led_signal(uint32_t *colors) {
-  for (uint32_t led = 0; led < LAB_LED_COUNT; ++led) {
-    uint32_t color = colors[led];
-    uint8_t green = (uint8_t)((color >> 16) & 0xFFU);
-    uint8_t red = (uint8_t)((color >> 8) & 0xFFU);
-    uint8_t blue = (uint8_t)(color & 0xFFU);
+  noInterrupts();
 
-    loadRmtWord(0, green);
-    loadRmtWord(8, red);
-    loadRmtWord(16, blue);
-    gRmtRam[24].val = 0;
-
-    REG_WRITE(LAB_RMT_INT_CLR_REG, RMT_CH0_TX_END_INT_CLR);
-    REG_SET_BIT(LAB_RMT_CH0_CONF0_REG, RMT_APB_MEM_RST_CH0);
-    REG_CLR_BIT(LAB_RMT_CH0_CONF0_REG, RMT_APB_MEM_RST_CH0);
-    REG_SET_BIT(LAB_RMT_CH0_CONF0_REG, RMT_MEM_RD_RST_CH0);
-    REG_CLR_BIT(LAB_RMT_CH0_CONF0_REG, RMT_MEM_RD_RST_CH0);
-    REG_SET_BIT(LAB_RMT_CH0_CONF0_REG, RMT_TX_START_CH0);
-    waitForRmtDone();
+  for (uint32_t led = 0; led < NUM_LEDS; ++led) {
+    uint8_t green = (uint8_t)((colors[led] >> 8) & 0xFFU);
+    uint8_t red = (uint8_t)((colors[led] >> 16) & 0xFFU);
+    uint8_t blue = (uint8_t)(colors[led] & 0xFFU);
+    send_led_byte(green);
+    send_led_byte(red);
+    send_led_byte(blue);
   }
 
-  delayMicroseconds(LAB_RMT_RESET_US);
+  interrupts();
+  wait_cycles(NS_TO_CPU_CYCLES(WS2812_RESET_US * 1000U));
 }
 
-void fillAllLeds(uint32_t color) {
-  for (uint32_t i = 0; i < LAB_LED_COUNT; ++i) {
-    gLedColors[i] = color;
+void build_audio_visual_frame(uint8_t sample, uint32_t sample_index) {
+  const float x = ((float)sample - 128.0f) / 128.0f;
+  const uint32_t band_colors[NUM_BANDS] = {
+      make_color(255, 80, 0),
+      make_color(255, 0, 70),
+      make_color(60, 255, 40),
+      make_color(0, 180, 255),
+      make_color(180, 0, 255)
+  };
+
+  g_lowpass_120 += 0.045f * (x - g_lowpass_120);
+  g_lowpass_300 += 0.10f * (x - g_lowpass_300);
+  g_lowpass_600 += 0.18f * (x - g_lowpass_600);
+  g_lowpass_1200 += 0.33f * (x - g_lowpass_1200);
+  g_lowpass_2400 += 0.55f * (x - g_lowpass_2400);
+
+  const float band_levels[NUM_BANDS] = {
+      fabsf(g_lowpass_120),
+      fabsf(g_lowpass_300 - g_lowpass_120),
+      fabsf(g_lowpass_600 - g_lowpass_300),
+      fabsf(g_lowpass_1200 - g_lowpass_600),
+      fabsf(g_lowpass_2400 - g_lowpass_1200),
+  };
+
+  for (uint32_t i = 0; i < NUM_LEDS; ++i) {
+    g_led_colors[i] = 0U;
   }
-  transmit_led_signal(gLedColors);
-}
 
-void runPowerOnSelfTest() {
-  const uint32_t postColor = scaleColor(makeColor(255, 255, 255), LAB_LED_BRIGHTNESS);
+  for (uint32_t band = 0; band < NUM_BANDS; ++band) {
+    float target = band_levels[band] * 2.8f;
+    if (target > 1.0f) target = 1.0f;
 
-  Serial.println("POST: initializing RMT and LEDC peripherals");
-  fillAllLeds(0U);
+    float response = (target > g_band_envelopes[band]) ? 0.50f : 0.15f;
+    g_band_envelopes[band] += response * (target - g_band_envelopes[band]);
 
-  Serial.println("POST: wiping all 100 LEDs with dim white");
-  for (uint32_t i = 0; i < LAB_LED_COUNT; ++i) {
-    gLedColors[i] = postColor;
-    transmit_led_signal(gLedColors);
-    delay(LAB_POST_WIPE_DELAY_MS);
+    uint32_t lit_count = (uint32_t)(g_band_envelopes[band] * LEDS_PER_BAND + 0.5f);
+    uint32_t start = band * LEDS_PER_BAND;
+    uint32_t end = start + LEDS_PER_BAND;
+    uint32_t peak = start + ((sample_index / AUDIO_LED_UPDATE_INTERVAL) % LEDS_PER_BAND);
+
+    for (uint32_t led = start; led < end; ++led) {
+      uint32_t color = 0U;
+      uint32_t relative = led - start;
+
+      if (relative < lit_count) {
+        float fade = 1.0f - ((float)relative / (float)LEDS_PER_BAND);
+        color = scale_color(band_colors[band], 0.25f + 0.75f * fade);
+      }
+
+      if ((led == peak) && (g_band_envelopes[band] > 0.08f)) {
+        color = scale_color(band_colors[band], 1.0f);
+      }
+
+      g_led_colors[led] = color;
+    }
   }
-
-  Serial.println("POST: hardware ready");
 }
 
-void setup() {
-  Serial.begin(LAB_SERIAL_BAUD);
-  delay(200);
-  gBootMillis = millis();
-  gLastLedRefreshUs = micros();
-
-  setup_RMT();
-  setup_LEDC();
-  runPowerOnSelfTest();
-
-#if LAB_HAS_AUDIO_ARRAY
-  gCurrentSampleRate = sampleRate;
-  Serial.printf("array.h detected, sampleRate = %lu Hz\n", (unsigned long)gCurrentSampleRate);
-#else
-  Serial.printf("array.h not found, fallback synth sampleRate = %lu Hz\n",
-                (unsigned long)gCurrentSampleRate);
-#endif
-  Serial.printf("Startup beep pattern active for %lu ms before audio playback\n",
-                (unsigned long)LAB_AUDIO_START_DELAY_MS);
-
-  uint32_t firstSample = nextStartupSample();
-  update_PWM(1, firstSample);
-  maybeUpdateVisualization(firstSample);
+void send_led_frame() {
+  transmit_led_signal(g_led_colors);
 }
 
-void loop() {
-  if (!(REG_READ(LAB_LEDC_INT_RAW_REG) & LEDC_LSTIMER0_OVF_INT_RAW)) return;
+void clear_leds() {
+  for (uint32_t i = 0; i < NUM_LEDS; ++i) {
+    g_led_colors[i] = 0U;
+  }
+  send_led_frame();
+}
 
-  uint32_t sample = audioPlaybackEnabled() ? nextAudioSample() : nextStartupSample();
-  update_PWM(0, sample);
-  maybeUpdateVisualization(sample);
+uint32_t make_color(uint8_t r, uint8_t g, uint8_t b) {
+  return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+uint32_t scale_color(uint32_t color, float scale) {
+  if (scale < 0.0f) scale = 0.0f;
+  if (scale > 1.0f) scale = 1.0f;
+
+  uint8_t r = (uint8_t)(((color >> 16) & 0xFFU) * scale);
+  uint8_t g = (uint8_t)(((color >> 8) & 0xFFU) * scale);
+  uint8_t b = (uint8_t)((color & 0xFFU) * scale);
+  return make_color(r, g, b);
 }
