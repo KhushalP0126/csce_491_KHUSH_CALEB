@@ -10,6 +10,10 @@
 namespace {
 
 // ---------------- Configuration ----------------
+// - FreeRTOS schedules the monitor task and the control task
+ // - PCNT reads encoder pulses from the motor shaft and estimates RPM
+ // - the PID/PI uses the difference between target RPM and measured RPM
+ // - LEDC sends the PWM duty cycle to the motor driver
 
 // Default to motor connector 1 from the project-board schematic:
 // DIR1 -> GPIO4, PWM1 -> GPIO5, ENC_A1 -> GPIO6, BRAKE -> GPIO21.
