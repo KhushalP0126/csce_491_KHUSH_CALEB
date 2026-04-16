@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <math.h>
 
+#include "esp_cpu.h"
 #include "soc/gpio_reg.h"
 #include "soc/gpio_sig_map.h"
 #include "soc/io_mux_reg.h"
