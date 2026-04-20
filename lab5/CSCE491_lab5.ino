@@ -10,10 +10,16 @@
 namespace {
 
 // ---------------- Configuration ----------------
-// - FreeRTOS schedules the monitor task and the control task
- // - PCNT reads encoder pulses from the motor shaft and estimates RPM
- // - the PID/PI uses the difference between target RPM and measured RPM
- // - LEDC sends the PWM duty cycle to the motor driver
+
+// LEDC = LED Control peripheral on the ESP32. It generates the PWM signal that
+// drives the motor speed input.
+// PCNT = Pulse Counter peripheral on the ESP32. It counts encoder pulses so the
+// code can estimate motor speed in RPM.
+// This lab does not use bitbanging. It uses ESP32 hardware peripherals plus
+// FreeRTOS tasks:
+// - the monitor task reads encoder pulses with PCNT and estimates RPM
+// - the control task uses the RPM error in the PID/PI math to choose a PWM duty
+// - LEDC outputs that PWM duty to the motor driver
 
 // Default to motor connector 1 from the project-board schematic:
 // DIR1 -> GPIO4, PWM1 -> GPIO5, ENC_A1 -> GPIO6, BRAKE -> GPIO21.
@@ -29,13 +35,14 @@ constexpr uint32_t kPwmFreqHz = 20000;
 constexpr uint8_t kPwmResolutionBits = 8;
 constexpr uint32_t kPwmMaxDuty = (1U << kPwmResolutionBits) - 1U;
 constexpr bool kPwmActiveLow = true;
-constexpr float kTargetRpm = 300.0f; //only works with 300 rpms
+constexpr float kTargetRpm = 300.0f;
 constexpr uint32_t kBaseDuty = 30U;
 constexpr float kKp = 0.06f;
 constexpr float kKi = 0.015f;
 constexpr float kIntegralClamp = 400.0f;
 constexpr float kErrorDeadbandRpm = 8.0f;
 constexpr float kIntegralBleed = 0.90f;
+constexpr float kRpmFilterAlpha = 0.25f;
 
 constexpr float kEncoderPulsesPerRev = 100.0f;
 
@@ -56,6 +63,7 @@ portMUX_TYPE gDataMux = portMUX_INITIALIZER_UNLOCKED;
 
 float gMeasuredPulseHz = 0.0f;
 float gMeasuredRpm = 0.0f;
+float gRawMeasuredRpm = 0.0f;
 float gTargetRpm = kTargetRpm;
 float gLastError = 0.0f;
 float gIntegralTerm = 0.0f;
@@ -238,11 +246,13 @@ void motorMonitorTask(void *args) {
     checkEsp(pcnt_unit_clear_count(gPcntUnit), "pcnt_unit_clear_count");
 
     float pulseHz = (float)pulseCount * (1000.0f / (float)kMonitorPeriodMs);
-    float rpm = pulseHz * (60.0f / kEncoderPulsesPerRev);
+    float rawRpm = pulseHz * (60.0f / kEncoderPulsesPerRev);
+    float filteredRpm = (kRpmFilterAlpha * rawRpm) + ((1.0f - kRpmFilterAlpha) * gMeasuredRpm);
 
     portENTER_CRITICAL(&gDataMux);
     gMeasuredPulseHz = pulseHz;
-    gMeasuredRpm = rpm;
+    gRawMeasuredRpm = rawRpm;
+    gMeasuredRpm = filteredRpm;
     gLastPulseCount = pulseCount;
     gTotalPulses += (uint64_t)max(pulseCount, 0);
     gMonitorCpuUs += esp_timer_get_time() - startTaskUs;
