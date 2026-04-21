@@ -31,21 +31,29 @@ constexpr uint8_t kMotorPwmPin = 5;
 constexpr uint8_t kMotorBrakePin = 21;
 constexpr uint8_t kSensePin = 15;
 constexpr uint8_t kMotorDirState = LOW;
+constexpr uint8_t kMotorBrakeState = HIGH;
 
 constexpr uint8_t kPwmChannel = 0;
-constexpr uint32_t kPwmFreqHz = 20000;
-constexpr uint8_t kPwmResolutionBits = 8;
+constexpr uint32_t kPwmFreqHz = 8000;
+constexpr uint8_t kPwmResolutionBits = 12;
 constexpr uint32_t kPwmMaxDuty = (1U << kPwmResolutionBits) - 1U;
+constexpr uint32_t kControlDutyMax = 255U;
 constexpr bool kPwmActiveLow = true;
-constexpr float kTargetRpm = 300.0f;
-constexpr uint32_t kBaseDuty = 30U;
-constexpr float kKp = 0.06f;
-constexpr float kKi = 0.015f;
-constexpr float kIntegralClamp = 400.0f;
-constexpr float kErrorDeadbandRpm = 8.0f;
-constexpr float kIntegralBleed = 0.90f;
+constexpr uint32_t kTargetStepPeriodMs = 20000;
+constexpr float kTargetRpmSequence[] = {300.0f, 600.0f, 900.0f, 1200.0f, 1500.0f};
+constexpr size_t kTargetRpmSequenceLength = sizeof(kTargetRpmSequence) / sizeof(kTargetRpmSequence[0]);
+constexpr float kKp = 0.10f;
+constexpr float kKi = 0.10f;
+constexpr float kKd = 0.0f;
+constexpr float kIntegralClamp = 2000.0f;
+constexpr float kErrorDeadbandRpm = 3.0f;
+constexpr float kIntegralBleed = 0.98f;
 constexpr float kRpmFilterAlpha = 0.25f;
+constexpr float kDutyRampUpPerCycle = 6.0f;
+constexpr float kDutyRampDownPerCycle = 10.0f;
 
+// Lab handout uses one encoder signal and one counted edge, so speed is based
+// on 100 pulses per shaft revolution.
 constexpr float kEncoderPulsesPerRev = 100.0f;
 
 constexpr uint32_t kMonitorPeriodMs = 50;
@@ -66,11 +74,13 @@ portMUX_TYPE gDataMux = portMUX_INITIALIZER_UNLOCKED;
 float gMeasuredPulseHz = 0.0f;
 float gMeasuredRpm = 0.0f;
 float gRawMeasuredRpm = 0.0f;
-float gTargetRpm = kTargetRpm;
+float gTargetRpm = kTargetRpmSequence[0];
 float gLastError = 0.0f;
-float gIntegralTerm = 0.0f;
+float gPTerm = 0.0f;
+float gITerm = 0.0f;
+float gDTerm = 0.0f;
+float gTotalPid = 0.0f;
 int gLastPulseCount = 0;
-uint32_t gCurrentDuty = 0U;
 uint64_t gTotalPulses = 0U;
 uint64_t gStartTimeUs = 0U;
 uint64_t gMonitorCpuUs = 0U;
@@ -80,16 +90,11 @@ uint64_t gControlCpuUs = 0U;
 
 struct TelemetrySnapshot {
   float targetRpm;
-  float measuredPulseHz;
   float measuredRpm;
-  float lastError;
-  float integralTerm;
-  int pulseCount;
-  uint32_t duty;
-  uint64_t totalPulses;
-  uint64_t monitorCpuUs;
-  uint64_t controlCpuUs;
-  uint64_t elapsedUs;
+  float pTerm;
+  float iTerm;
+  float dTerm;
+  float totalPid;
 };
 
 // ---------------- Utility Helpers ----------------
@@ -128,13 +133,15 @@ float rampFloatToward(float currentValue, float targetValue, float rampUpStep, f
 
 uint32_t clampDuty(float duty) {
   if (duty <= 0.0f) return 0U;
-  if (duty >= (float)kPwmMaxDuty) return kPwmMaxDuty;
+  if (duty >= (float)kControlDutyMax) return kControlDutyMax;
   return (uint32_t)lroundf(duty);
 }
 
 uint32_t toHardwareDuty(uint32_t logicalDuty) {
-  if (!kPwmActiveLow) return logicalDuty;
-  return kPwmMaxDuty - logicalDuty;
+  uint32_t pwmCounts =
+      (uint32_t)lroundf(((float)logicalDuty * (float)kPwmMaxDuty) / (float)kControlDutyMax);
+  if (!kPwmActiveLow) return pwmCounts;
+  return kPwmMaxDuty - pwmCounts;
 }
 
 float readSupplyVoltage() {
@@ -148,16 +155,11 @@ TelemetrySnapshot readTelemetrySnapshot() {
 
   portENTER_CRITICAL(&gDataMux);
   snapshot.targetRpm = gTargetRpm;
-  snapshot.measuredPulseHz = gMeasuredPulseHz;
   snapshot.measuredRpm = gMeasuredRpm;
-  snapshot.lastError = gLastError;
-  snapshot.integralTerm = gIntegralTerm;
-  snapshot.pulseCount = gLastPulseCount;
-  snapshot.duty = gCurrentDuty;
-  snapshot.totalPulses = gTotalPulses;
-  snapshot.monitorCpuUs = gMonitorCpuUs;
-  snapshot.controlCpuUs = gControlCpuUs;
-  snapshot.elapsedUs = esp_timer_get_time() - gStartTimeUs;
+  snapshot.pTerm = gPTerm;
+  snapshot.iTerm = gITerm;
+  snapshot.dTerm = gDTerm;
+  snapshot.totalPid = gTotalPid;
   portEXIT_CRITICAL(&gDataMux);
 
   return snapshot;
@@ -165,19 +167,14 @@ TelemetrySnapshot readTelemetrySnapshot() {
 
 void printSerialTelemetry() {
   TelemetrySnapshot snapshot = readTelemetrySnapshot();
-  if (snapshot.elapsedUs == 0U) return;
-  float supplyVoltage = readSupplyVoltage();
-
   Serial.printf(
-      "target_rpm:%.2f\tmeasured_rpm:%.2f\tduty:%lu\terror:%.2f\ti_term:%.2f\tpulse_count:%d\tencoder_hz:%.2f\tsupply_v:%.2f\n",
+      "target_rpm:%.2f\tmeasured_rpm:%.2f\tp_term:%.2f\ti_term:%.2f\td_term:%.2f\ttotal_pid:%.2f\n",
       snapshot.targetRpm,
       snapshot.measuredRpm,
-      (unsigned long)snapshot.duty,
-      snapshot.lastError,
-      snapshot.integralTerm,
-      snapshot.pulseCount,
-      snapshot.measuredPulseHz,
-      supplyVoltage);
+      snapshot.pTerm,
+      snapshot.iTerm,
+      snapshot.dTerm,
+      snapshot.totalPid);
 }
 
 // ---------------- Motor Hardware Setup ----------------
@@ -188,20 +185,23 @@ void setupMotorPinsAndPwm() {
   pinMode(kSensePin, INPUT);
   pinMode(kMotorEncoderPin, INPUT_PULLUP);
 
-  // Lab instructions: use one direction only and keep the brake disabled.
+  // Lab instructions: use one direction only, with direction = 0 and brake = 0.
   digitalWrite(kMotorDirPin, kMotorDirState);
-  digitalWrite(kMotorBrakePin, HIGH);
+  digitalWrite(kMotorBrakePin, kMotorBrakeState);
   Serial.printf(
       "Direction locked on GPIO%u (state=%s)\n",
       kMotorDirPin,
       (kMotorDirState == LOW) ? "LOW" : "HIGH");
-  Serial.printf("Brake disengaged on GPIO%u (state=HIGH)\n", kMotorBrakePin);
+  Serial.printf(
+      "Brake fixed on GPIO%u (state=%s)\n",
+      kMotorBrakePin,
+      (kMotorBrakeState == LOW) ? "LOW" : "HIGH");
 
   if (!ledcAttachChannel(kMotorPwmPin, kPwmFreqHz, kPwmResolutionBits, kPwmChannel)) {
     failFast("LEDC attach failed");
   }
 
-  if (!ledcWrite(kMotorPwmPin, 0U)) {
+  if (!ledcWrite(kMotorPwmPin, toHardwareDuty(0U))) {
     failFast("Initial PWM write failed");
   }
 }
@@ -272,14 +272,18 @@ void motorControlTask(void *args) {
   TickType_t lastWakeTime = xTaskGetTickCount();
   constexpr float kDtSeconds = (float)kControlPeriodMs / 1000.0f;
   float integralError = 0.0f;
+  float previousError = 0.0f;
+  float appliedDuty = 0.0f;
   for (;;) {
     uint64_t startTaskUs = esp_timer_get_time();
     float measuredRpm = 0.0f;
+    float targetRpm = 0.0f;
     portENTER_CRITICAL(&gDataMux);
     measuredRpm = gMeasuredRpm;
+    targetRpm = gTargetRpm;
     portEXIT_CRITICAL(&gDataMux);
 
-    float rawError = kTargetRpm - measuredRpm;
+    float rawError = targetRpm - measuredRpm;
     float error = rawError;
     if (fabsf(rawError) <= kErrorDeadbandRpm) {
       error = 0.0f;
@@ -288,18 +292,26 @@ void motorControlTask(void *args) {
       integralError = clampFloat(
           integralError + (error * kDtSeconds), -kIntegralClamp, kIntegralClamp);
     }
-    float controlDuty = (float)kBaseDuty + (kKp * error) + (kKi * integralError);
-    uint32_t targetDuty = clampDuty(controlDuty);
+    float pTerm = kKp * error;
+    float iTerm = kKi * integralError;
+    float dTerm = kKd * ((error - previousError) / kDtSeconds);
+    float totalPid = pTerm + iTerm + dTerm;
+    float commandedDuty = clampFloat(totalPid, 0.0f, (float)kControlDutyMax);
+    appliedDuty =
+        rampFloatToward(appliedDuty, commandedDuty, kDutyRampUpPerCycle, kDutyRampDownPerCycle);
+    uint32_t targetDuty = clampDuty(appliedDuty);
     uint32_t hardwareDuty = toHardwareDuty(targetDuty);
     if (!ledcWrite(kMotorPwmPin, hardwareDuty)) {
       failFast("PWM update failed");
     }
+    previousError = error;
 
     portENTER_CRITICAL(&gDataMux);
-    gTargetRpm = kTargetRpm;
     gLastError = error;
-    gIntegralTerm = kKi * integralError;
-    gCurrentDuty = targetDuty;
+    gPTerm = pTerm;
+    gITerm = iTerm;
+    gDTerm = dTerm;
+    gTotalPid = totalPid;
     gControlCpuUs += esp_timer_get_time() - startTaskUs;
     portEXIT_CRITICAL(&gDataMux);
     vTaskDelayUntil(&lastWakeTime, kControlPeriodTicks);
@@ -342,16 +354,26 @@ void setup() {
   }
 
   Serial.printf(
-      "Closed-loop PI mode, target %.2f RPM, base duty %lu, monitor period %lu ms, control period %lu ms\n",
-      kTargetRpm,
-      (unsigned long)kBaseDuty,
+      "Closed-loop PID mode, initial target %.2f RPM, step period %lu ms, monitor period %lu ms, control period %lu ms\n",
+      gTargetRpm,
+      (unsigned long)kTargetStepPeriodMs,
       (unsigned long)kMonitorPeriodMs,
       (unsigned long)kControlPeriodMs);
 }
 
 void loop() {
   static uint32_t lastReportMs = 0U;
+  static uint32_t lastTargetStepMs = 0U;
+  static size_t targetIndex = 0U;
   uint32_t now = millis();
+
+  if (now - lastTargetStepMs >= kTargetStepPeriodMs) {
+    lastTargetStepMs = now;
+    targetIndex = (targetIndex + 1U) % kTargetRpmSequenceLength;
+    portENTER_CRITICAL(&gDataMux);
+    gTargetRpm = kTargetRpmSequence[targetIndex];
+    portEXIT_CRITICAL(&gDataMux);
+  }
 
   if (now - lastReportMs >= kTelemetryPeriodMs) {
     lastReportMs = now;
