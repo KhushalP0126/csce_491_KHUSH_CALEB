@@ -40,7 +40,7 @@ constexpr uint32_t kPwmMaxDuty = (1U << kPwmResolutionBits) - 1U;
 constexpr uint32_t kControlDutyMax = 255U;
 constexpr bool kPwmActiveLow = true;
 constexpr uint32_t kTargetStepPeriodMs = 20000;
-constexpr float kTargetRpmSequence[] = {300.0f, 600.0f, 900.0f, 1200.0f, 1500.0f};
+constexpr float kTargetRpmSequence[] = {300.0f, 600.0f, 3000.0f, 1200.0f, 1500.0f};
 constexpr size_t kTargetRpmSequenceLength = sizeof(kTargetRpmSequence) / sizeof(kTargetRpmSequence[0]);
 constexpr float kKp = 0.10f;
 constexpr float kKi = 0.10f;
@@ -62,29 +62,17 @@ constexpr uint32_t kTelemetryPeriodMs = 100;
 constexpr TickType_t kMonitorPeriodTicks = pdMS_TO_TICKS(kMonitorPeriodMs);
 constexpr TickType_t kControlPeriodTicks = pdMS_TO_TICKS(kControlPeriodMs);
 
-constexpr float kBenchSupplyVoltage = 12.0f;
-
 pcnt_unit_handle_t gPcntUnit = nullptr;
 pcnt_channel_handle_t gPcntChannel = nullptr;
-TaskHandle_t gMonitorTaskHandle = nullptr;
-TaskHandle_t gControlTaskHandle = nullptr;
 
 portMUX_TYPE gDataMux = portMUX_INITIALIZER_UNLOCKED;
 
-float gMeasuredPulseHz = 0.0f;
 float gMeasuredRpm = 0.0f;
-float gRawMeasuredRpm = 0.0f;
 float gTargetRpm = kTargetRpmSequence[0];
-float gLastError = 0.0f;
 float gPTerm = 0.0f;
 float gITerm = 0.0f;
 float gDTerm = 0.0f;
 float gTotalPid = 0.0f;
-int gLastPulseCount = 0;
-uint64_t gTotalPulses = 0U;
-uint64_t gStartTimeUs = 0U;
-uint64_t gMonitorCpuUs = 0U;
-uint64_t gControlCpuUs = 0U;
 
 // ---------------- Shared Telemetry State ----------------
 
@@ -142,10 +130,6 @@ uint32_t toHardwareDuty(uint32_t logicalDuty) {
       (uint32_t)lroundf(((float)logicalDuty * (float)kPwmMaxDuty) / (float)kControlDutyMax);
   if (!kPwmActiveLow) return pwmCounts;
   return kPwmMaxDuty - pwmCounts;
-}
-
-float readSupplyVoltage() {
-  return kBenchSupplyVoltage;
 }
 
 // ---------------- Serial Monitor Helpers ----------------
@@ -241,8 +225,8 @@ void motorMonitorTask(void *args) {
   TickType_t lastWakeTime = xTaskGetTickCount();
 
   for (;;) {
-    uint64_t startTaskUs = esp_timer_get_time();
-
+    // This loop runs at a fixed rate to read encoder pulses and update the
+    // filtered RPM estimate that the controller uses.
     int pulseCount = 0;
     checkEsp(pcnt_unit_get_count(gPcntUnit, &pulseCount), "pcnt_unit_get_count");
     checkEsp(pcnt_unit_clear_count(gPcntUnit), "pcnt_unit_clear_count");
@@ -252,12 +236,7 @@ void motorMonitorTask(void *args) {
     float filteredRpm = (kRpmFilterAlpha * rawRpm) + ((1.0f - kRpmFilterAlpha) * gMeasuredRpm);
 
     portENTER_CRITICAL(&gDataMux);
-    gMeasuredPulseHz = pulseHz;
-    gRawMeasuredRpm = rawRpm;
     gMeasuredRpm = filteredRpm;
-    gLastPulseCount = pulseCount;
-    gTotalPulses += (uint64_t)max(pulseCount, 0);
-    gMonitorCpuUs += esp_timer_get_time() - startTaskUs;
     portEXIT_CRITICAL(&gDataMux);
 
     vTaskDelayUntil(&lastWakeTime, kMonitorPeriodTicks);
@@ -275,7 +254,8 @@ void motorControlTask(void *args) {
   float previousError = 0.0f;
   float appliedDuty = 0.0f;
   for (;;) {
-    uint64_t startTaskUs = esp_timer_get_time();
+    // This loop runs at a fixed rate to compute PID terms from the latest RPM
+    // error and update the PWM command sent to the motor driver.
     float measuredRpm = 0.0f;
     float targetRpm = 0.0f;
     portENTER_CRITICAL(&gDataMux);
@@ -307,12 +287,10 @@ void motorControlTask(void *args) {
     previousError = error;
 
     portENTER_CRITICAL(&gDataMux);
-    gLastError = error;
     gPTerm = pTerm;
     gITerm = iTerm;
     gDTerm = dTerm;
     gTotalPid = totalPid;
-    gControlCpuUs += esp_timer_get_time() - startTaskUs;
     portEXIT_CRITICAL(&gDataMux);
     vTaskDelayUntil(&lastWakeTime, kControlPeriodTicks);
   }
@@ -342,12 +320,8 @@ void setup() {
   setupMotorPinsAndPwm();
   setupEncoderCounter();
 
-  gStartTimeUs = esp_timer_get_time();
-
-  BaseType_t monitorOk = xTaskCreate(
-      motorMonitorTask, "motor_monitor", 4096, nullptr, 2, &gMonitorTaskHandle);
-  BaseType_t controlOk = xTaskCreate(
-      motorControlTask, "motor_control", 4096, nullptr, 2, &gControlTaskHandle);
+  BaseType_t monitorOk = xTaskCreate(motorMonitorTask, "motor_monitor", 4096, nullptr, 2, nullptr);
+  BaseType_t controlOk = xTaskCreate(motorControlTask, "motor_control", 4096, nullptr, 2, nullptr);
 
   if (monitorOk != pdPASS || controlOk != pdPASS) {
     failFast("Task creation failed");
@@ -367,6 +341,8 @@ void loop() {
   static size_t targetIndex = 0U;
   uint32_t now = millis();
 
+  // This loop advances the target-RPM schedule every 20 seconds and prints the
+  // latest telemetry often enough for the Serial Plotter.
   if (now - lastTargetStepMs >= kTargetStepPeriodMs) {
     lastTargetStepMs = now;
     targetIndex = (targetIndex + 1U) % kTargetRpmSequenceLength;
